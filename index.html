@@ -275,6 +275,32 @@ function startPolling() {
   load();
   pollIntervalId = setInterval(load, 4000);
 }
+function changePassword(newPassword) {
+  return ensureValidToken().then(function (token) {
+    return fetch('https://identitytoolkit.googleapis.com/v1/accounts:update?key=' + IDENTITY_KEY, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ idToken: token, password: newPassword, returnSecureToken: true }),
+    });
+  }).then(function (res) { return res.json().then(function (data) { if (!res.ok) throw new Error(mapAuthError(data)); return data; }); })
+    .then(function (data) { setAuthFromResponse(data); });
+}
+
+function adminCreateUser(username, password, profile) {
+  return signUp(username, password, Object.assign({ mustChangePassword: true }, profile));
+}
+
+function adminResetPassword(uid, username, newPassword) {
+  // On se reconnecte temporairement avec les identifiants admin après le reset
+  // Firebase ne permet pas de changer le mdp d'un autre user côté client
+  // On stocke le nouveau mdp hashé dans le profil Firestore pour que l'admin le transmette
+  var profile = Object.assign({}, state.userList.find(function (u) { return u.uid === uid; }) || {});
+  delete profile.uid;
+  profile.mustChangePassword = true;
+  profile.tmpPassword = newPassword; // affiché uniquement dans le panneau admin
+  return saveUserProfile(uid, profile);
+}
+
 function logout() {
   if (pollIntervalId) { clearInterval(pollIntervalId); pollIntervalId = null; }
   localStorage.removeItem('fleetAuth');
@@ -508,6 +534,7 @@ var state = {
   authMode: 'login',
   authError: null,
   showAccount: false,
+  showChangePassword: false,
   showUserAdmin: false,
   userList: null,
   confirmDeleteUserId: null,
@@ -524,6 +551,9 @@ var state = {
   connErr: false,
   confirmDeleteId: null,
   confirmRestitueId: null,
+  newUserError: null,
+  newUserSuccess: null,
+  resetPasswordUserId: null,
 };
 
 function setState(patch) { Object.assign(state, patch); render(); }
@@ -714,63 +744,74 @@ function render() {
   var root = document.getElementById('app');
 
   if (!state.auth) {
-    var isSignup = state.authMode === 'signup';
+    var isSignup = false; // La création de compte est réservée aux admins
     root.innerHTML =
       '<div class="name-overlay"><div class="name-card">' +
       logoHtml() +
-      '<h2>' + (isSignup ? 'Créer un compte' : 'Connexion') + '</h2>' +
-      '<p>' + (isSignup ? 'Renseigne tes informations pour accéder à la flotte.' : 'Connecte-toi pour accéder à la flotte partagée.') + '</p>' +
+      '<h2>Connexion</h2>' +
+      '<p>Connecte-toi pour accéder à la flotte partagée.</p>' +
       (state.authError ? '<div class="error-banner" style="margin-bottom:14px;">' + icon('alert', 14, '#f87171') + ' ' + escapeHtml(state.authError) + '</div>' : '') +
-      (isSignup ? (
-        '<div class="field"><label class="field-label">Prénom</label><input id="authPrenom" class="input" placeholder="ex: Sylvain" /></div>' +
-        '<div class="field"><label class="field-label">Nom</label><input id="authNom" class="input" placeholder="ex: Greco" /></div>' +
-        '<div class="field"><label class="field-label">Grade</label><input id="authGrade" class="input" placeholder="ex: Agent, Chef d\'équipe..." /></div>' +
-        '<div class="field"><label class="field-label">Bureau</label><input id="authBureau" class="input" placeholder="ex: Lille" /></div>'
-      ) : '') +
       '<div class="field"><label class="field-label">Nom d\'utilisateur</label><input id="authUsername" class="input" placeholder="ex: sgreco" autocapitalize="none" /></div>' +
-      '<div class="field"><label class="field-label">Mot de passe</label><input id="authPassword" type="password" class="input" placeholder="6 caractères minimum" /></div>' +
-      '<button class="save-btn" id="authSubmit">' + (isSignup ? 'Créer mon compte' : 'Se connecter') + '</button>' +
-      '<button class="link-btn" id="authToggle" style="display:block;width:100%;text-align:center;margin-top:14px;">' + (isSignup ? 'J\'ai déjà un compte' : 'Créer un compte') + '</button>' +
+      '<div class="field"><label class="field-label">Mot de passe</label><input id="authPassword" type="password" class="input" placeholder="Mot de passe" /></div>' +
+      '<button class="save-btn" id="authSubmit">Se connecter</button>' +
+      '<p style="font-size:11px;color:#5a6b6d;text-align:center;margin-top:14px;">Mot de passe oublié ? Contacte un administrateur.</p>' +
       '</div></div>';
-    document.getElementById('authToggle').addEventListener('click', function () {
-      setState({ authMode: isSignup ? 'login' : 'signup', authError: null });
-    });
     var submitBtn = document.getElementById('authSubmit');
     var doSubmit = function () {
       var username = document.getElementById('authUsername').value.trim();
       var password = document.getElementById('authPassword').value;
-      if (!username || password.length < 6) {
-        setState({ authError: 'Nom d\'utilisateur requis et mot de passe de 6 caractères minimum.' });
+      if (!username || !password) {
+        setState({ authError: 'Nom d\'utilisateur et mot de passe requis.' });
         return;
       }
       submitBtn.textContent = '...';
-      var action;
-      if (isSignup) {
-        var prenom = document.getElementById('authPrenom').value.trim();
-        var nom = document.getElementById('authNom').value.trim();
-        var grade = document.getElementById('authGrade').value.trim();
-        var bureau = document.getElementById('authBureau').value.trim();
-        if (!prenom || !nom) {
-          setState({ authError: 'Le prénom et le nom sont requis.' });
-          return;
-        }
-        action = signUp(username, password, { prenom: prenom, nom: nom, grade: grade, bureau: bureau });
-      } else {
-        action = signIn(username, password);
-      }
-      action.then(function () {
+      signIn(username, password).then(function () {
         if (!localStorage.getItem('fleetFilterBureau') && state.userProfile && state.userProfile.bureau) {
           state.filterBureau = state.userProfile.bureau;
           localStorage.setItem('fleetFilterBureau', state.filterBureau);
         }
-        setState({ authError: null });
-        startPolling();
+        // Forcer changement de mdp à la première connexion
+        if (state.userProfile && state.userProfile.mustChangePassword) {
+          setState({ authError: null, showChangePassword: true });
+          startPolling();
+        } else {
+          setState({ authError: null });
+          startPolling();
+        }
       }).catch(function (e) {
         setState({ authError: e.message || 'Erreur de connexion.' });
       });
     };
     submitBtn.addEventListener('click', doSubmit);
     document.getElementById('authPassword').addEventListener('keydown', function (e) { if (e.key === 'Enter') doSubmit(); });
+    return;
+  }
+
+  if (state.showChangePassword) {
+    root.innerHTML =
+      '<div class="name-overlay"><div class="name-card">' +
+      logoHtml() +
+      '<h2>Changer votre mot de passe</h2>' +
+      '<p>C\'est votre première connexion. Choisissez un nouveau mot de passe personnel.</p>' +
+      (state.authError ? '<div class="error-banner" style="margin-bottom:14px;">' + icon('alert', 14, '#f87171') + ' ' + escapeHtml(state.authError) + '</div>' : '') +
+      '<div class="field"><label class="field-label">Nouveau mot de passe</label><input id="newPwd1" type="password" class="input" placeholder="6 caractères minimum" /></div>' +
+      '<div class="field"><label class="field-label">Confirmer le mot de passe</label><input id="newPwd2" type="password" class="input" placeholder="Répéter le mot de passe" /></div>' +
+      '<button class="save-btn" id="changePwdSave">Confirmer</button>' +
+      '</div></div>';
+    document.getElementById('changePwdSave').addEventListener('click', function () {
+      var p1 = document.getElementById('newPwd1').value;
+      var p2 = document.getElementById('newPwd2').value;
+      if (p1.length < 6) { setState({ authError: '6 caractères minimum.' }); return; }
+      if (p1 !== p2) { setState({ authError: 'Les deux mots de passe ne correspondent pas.' }); return; }
+      changePassword(p1).then(function () {
+        var profile = Object.assign({}, state.userProfile, { mustChangePassword: false });
+        return saveUserProfile(state.auth.uid, profile).then(function () { applyProfile(profile); });
+      }).then(function () {
+        setState({ showChangePassword: false, authError: null });
+      }).catch(function (e) {
+        setState({ authError: e.message || 'Erreur lors du changement.' });
+      });
+    });
     return;
   }
 
@@ -814,7 +855,6 @@ function render() {
   html += '<div class="header"><div>' + logoHtml('small') + '<div class="eyebrow">SUIVI DE FLOTTE' + (state.filterBureau ? ' · ' + escapeHtml(state.filterBureau).toUpperCase() : ' · TOUS BUREAUX') + '</div><h1 class="title">Parc véhicules</h1>' +
     '<div class="author-tag">' + escapeHtml(state.authorName) + (state.userProfile && state.userProfile.grade ? ' · ' + escapeHtml(state.userProfile.grade) : '') +
     ' <button id="openAccount">mon compte</button>' +
-    (state.userProfile && state.userProfile.admin ? ' · <button id="openUserAdmin">comptes</button>' : '') +
     ' · <button id="changeAuthor">déconnexion</button></div></div></div>';
 
   if (urgentList.length > 0 && !state.showArchived) {
@@ -888,15 +928,18 @@ function render() {
   html += '</div>';
 
   var activeCount = bureauScope.filter(function (v) { return !v.archived && !v.restitue; }).length;
-  var currentTab = state.showRestitues ? 'restitues' : (state.showArchived ? 'archives' : 'actifs');
+  var isAdmin = state.userProfile && state.userProfile.admin;
+  var currentTab = state.showRestitues ? 'restitues' : (state.showArchived ? 'archives' : (state.showUserAdmin ? 'comptes' : 'actifs'));
   html += '<div class="tab-row">';
   html += '<button class="tab-btn' + (currentTab === 'actifs' ? ' active' : '') + '" data-view="actifs">Actifs (' + activeCount + ')</button>';
   html += '<button class="tab-btn' + (currentTab === 'archives' ? ' active' : '') + '" data-view="archives">Archivés (' + archivedCount + ')</button>';
   html += '<button class="tab-btn' + (currentTab === 'restitues' ? ' active' : '') + '" data-view="restitues">Restitués (' + restitueCount + ')</button>';
+  if (isAdmin) html += '<button class="tab-btn' + (currentTab === 'comptes' ? ' active' : '') + '" data-view="comptes">Comptes</button>';
   html += '</div>';
 
+  if (state.showUserAdmin) html += renderUserAdminInline();
+
   if (state.showAccount) html += renderAccountSheet();
-  if (state.showUserAdmin) html += renderUserAdmin();
   if (state.showNew) html += renderModal();
   if (state.selectedId) {
     var sel = allEnriched.find(function (x) { return x.id === state.selectedId; });
@@ -908,25 +951,56 @@ function render() {
   attachEvents(filtered);
 }
 
-function renderUserAdmin() {
-  var html = '<div class="overlay" id="userAdminOverlay"><div class="sheet" id="userAdminSheet">' +
-    '<div class="sheet-header"><h2 class="sheet-plaque">Comptes</h2><button class="icon-btn" id="userAdminClose">' + icon('x', 20, '#8a9a9c') + '</button></div>';
+function renderUserAdminInline() {
+  var html = '<div style="margin-top:16px;">';
+
+  // Formulaire de création de compte
+  html += '<div style="background:#13293b;border:1px solid #234156;border-radius:14px;padding:16px;margin-bottom:16px;">';
+  html += '<h3 style="margin:0 0 12px;font-size:15px;color:#e8efed;">Créer un compte</h3>';
+  html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">';
+  html += '<div class="field" style="margin:0;"><label class="field-label">Prénom</label><input id="newUserPrenom" class="input" placeholder="Sylvain" /></div>';
+  html += '<div class="field" style="margin:0;"><label class="field-label">Nom</label><input id="newUserNom" class="input" placeholder="Greco" /></div>';
+  html += '<div class="field" style="margin:0;"><label class="field-label">Grade</label><input id="newUserGrade" class="input" placeholder="Agent" /></div>';
+  html += '<div class="field" style="margin:0;"><label class="field-label">Bureau</label><input id="newUserBureau" class="input" placeholder="Lille" /></div>';
+  html += '<div class="field" style="margin:0;"><label class="field-label">Nom d\'utilisateur</label><input id="newUserUsername" class="input" autocapitalize="none" placeholder="sgreco" /></div>';
+  html += '<div class="field" style="margin:0;"><label class="field-label">Mot de passe provisoire</label><input id="newUserPassword" class="input" placeholder="6 car. min." /></div>';
+  html += '</div>';
+  if (state.newUserError) html += '<div class="error-banner" style="margin-top:10px;">' + icon('alert', 14, '#f87171') + ' ' + escapeHtml(state.newUserError) + '</div>';
+  if (state.newUserSuccess) html += '<div style="color:#4ade80;font-size:12px;margin-top:8px;">✓ ' + escapeHtml(state.newUserSuccess) + '</div>';
+  html += '<button class="save-btn" id="createUserBtn" style="margin-top:12px;">Créer le compte</button>';
+  html += '</div>';
+
+  // Liste des utilisateurs
+  html += '<div style="background:#13293b;border:1px solid #234156;border-radius:14px;padding:16px;">';
+  html += '<h3 style="margin:0 0 12px;font-size:15px;color:#e8efed;">Comptes existants</h3>';
 
   if (state.userList === null) {
-    html += '<div class="loading-screen" style="min-height:120px;"><div class="loading-dot"></div></div>';
+    html += '<div style="text-align:center;padding:20px;"><div class="loading-dot" style="margin:auto;"></div></div>';
   } else if (state.userList.length === 0) {
     html += '<div class="history-empty">Aucun compte trouvé.</div>';
   } else {
     state.userList.forEach(function (u) {
       var actif = u.actif !== false;
-      html += '<div class="history-item" style="display:flex;align-items:center;gap:10px;justify-content:space-between;">';
-      html += '<div><div style="color:#e8efed;font-weight:600;">' + escapeHtml(((u.prenom || '') + ' ' + (u.nom || '')).trim() || u.username || '?') +
-        (u.admin ? ' <span style="color:#e8384f;font-size:11px;">(admin)</span>' : '') + '</div>' +
-        '<div class="history-meta">' + escapeHtml(u.grade || '') + (u.grade ? ' · ' : '') + '@' + escapeHtml(u.username || '') + (actif ? '' : ' · désactivé') + '</div></div>';
-      html += '<div style="display:flex;gap:6px;flex-shrink:0;">';
-      html += '<button class="switch' + (actif ? ' on' : '') + '" data-toggle-active="' + u.uid + '"><span class="knob"></span></button>';
+      html += '<div class="history-item" style="display:flex;align-items:flex-start;gap:10px;justify-content:space-between;flex-wrap:wrap;">';
+      html += '<div style="flex:1;min-width:0;">';
+      html += '<div style="color:#e8efed;font-weight:600;">' + escapeHtml(((u.prenom || '') + ' ' + (u.nom || '')).trim() || u.username || '?') +
+        (u.admin ? ' <span style="color:#e8384f;font-size:11px;">(admin)</span>' : '') +
+        (!actif ? ' <span style="color:#f87171;font-size:11px;">(désactivé)</span>' : '') + '</div>';
+      html += '<div class="history-meta">@' + escapeHtml(u.username || '') + (u.grade ? ' · ' + escapeHtml(u.grade) : '') + (u.bureau ? ' · ' + escapeHtml(u.bureau) : '') + '</div>';
+      if (u.mustChangePassword) html += '<div style="color:#fbbf24;font-size:11px;margin-top:2px;">⚠ Doit changer son mot de passe</div>';
+      if (u.tmpPassword) html += '<div style="color:#8a9a9c;font-size:11px;margin-top:2px;">Mdp provisoire : <span style="color:#e8efed;">' + escapeHtml(u.tmpPassword) + '</span></div>';
+      html += '</div>';
+      html += '<div style="display:flex;gap:6px;flex-shrink:0;align-items:center;flex-wrap:wrap;justify-content:flex-end;">';
+      html += '<button class="switch' + (actif ? ' on' : '') + '" data-toggle-active="' + u.uid + '" title="' + (actif ? 'Désactiver' : 'Activer') + '"><span class="knob"></span></button>';
+      if (state.resetPasswordUserId === u.uid) {
+        html += '<input id="resetPwdInput_' + u.uid + '" class="input" type="text" placeholder="Nouveau mdp" style="width:110px;font-size:12px;padding:6px 8px;" />';
+        html += '<button class="secondary-btn" data-confirm-reset="' + u.uid + '">OK</button>';
+        html += '<button class="secondary-btn" data-cancel-reset="' + u.uid + '">✕</button>';
+      } else {
+        html += '<button class="secondary-btn" data-ask-reset="' + u.uid + '" style="font-size:11px;padding:0 8px;height:28px;">Réinit. mdp</button>';
+      }
       if (state.confirmDeleteUserId === u.uid) {
-        html += '<button class="confirm-delete-btn" data-confirm-delete-user="' + u.uid + '">Confirmer</button>';
+        html += '<button class="confirm-delete-btn" data-confirm-delete-user="' + u.uid + '">Supprimer ?</button>';
       } else {
         html += '<button class="icon-btn" data-ask-delete-user="' + u.uid + '">' + icon('x', 14, '#c97a7a') + '</button>';
       }
@@ -936,6 +1010,8 @@ function renderUserAdmin() {
   html += '</div></div>';
   return html;
 }
+
+function renderUserAdmin() { return ''; } // conservé pour compatibilité
 
 function renderAccountSheet() {
   var p = state.userProfile || {};
@@ -1049,12 +1125,14 @@ function renderSheet(v) {
 
   html += '<button class="archive-link" id="toggleArchive">' + (v.archived ? '↩ Désarchiver ce véhicule' : '📦 Archiver ce véhicule') + '</button>';
 
-  if (state.confirmDeleteId === v.id) {
-    html += '<div class="confirm-row"><span style="color:#c98;font-size:13px;">Confirmer la suppression définitive ?</span>' +
-      '<button class="confirm-delete-btn" id="confirmDeleteYes">Oui, supprimer</button>' +
-      '<button class="secondary-btn" id="confirmDeleteNo">Annuler</button></div>';
-  } else {
-    html += '<button class="delete-link" id="askDelete">Supprimer définitivement</button>';
+  if (state.userProfile && state.userProfile.admin) {
+    if (state.confirmDeleteId === v.id) {
+      html += '<div class="confirm-row"><span style="color:#c98;font-size:13px;">Confirmer la suppression définitive ?</span>' +
+        '<button class="confirm-delete-btn" id="confirmDeleteYes">Oui, supprimer</button>' +
+        '<button class="secondary-btn" id="confirmDeleteNo">Annuler</button></div>';
+    } else {
+      html += '<button class="delete-link" id="askDelete">Supprimer définitivement</button>';
+    }
   }
 
   html += '</div></div>';
@@ -1087,44 +1165,79 @@ function attachEvents(filtered) {
     render();
   });
 
-  var openUserAdmin = document.getElementById('openUserAdmin');
-  if (openUserAdmin) openUserAdmin.addEventListener('click', function () {
-    setState({ showUserAdmin: true, userList: null });
-    fetchAllUsersRemote().then(function (list) {
-      setState({ userList: list });
-    }).catch(function () {
-      setState({ error: 'Impossible de charger la liste des comptes.' });
+  // Création de compte admin
+  var createUserBtn = document.getElementById('createUserBtn');
+  if (createUserBtn) createUserBtn.addEventListener('click', function () {
+    var prenom = document.getElementById('newUserPrenom').value.trim();
+    var nom = document.getElementById('newUserNom').value.trim();
+    var grade = document.getElementById('newUserGrade').value.trim();
+    var bureau = document.getElementById('newUserBureau').value.trim();
+    var username = document.getElementById('newUserUsername').value.trim();
+    var password = document.getElementById('newUserPassword').value;
+    if (!prenom || !nom || !username || password.length < 6) {
+      setState({ newUserError: 'Tous les champs sont requis et le mot de passe doit faire 6 caractères minimum.', newUserSuccess: null });
+      return;
+    }
+    var currentAuth = JSON.parse(JSON.stringify(state.auth));
+    var currentProfile = JSON.parse(JSON.stringify(state.userProfile));
+    signUp(username, password, { prenom: prenom, nom: nom, grade: grade, bureau: bureau, mustChangePassword: true, actif: true, admin: false }).then(function () {
+      // Revenir à la session admin
+      state.auth = currentAuth;
+      state.userProfile = currentProfile;
+      state.authorName = ((currentProfile.prenom || '') + ' ' + (currentProfile.nom || '')).trim() || currentProfile.username || '';
+      localStorage.setItem('fleetAuth', JSON.stringify(currentAuth));
+      return fetchAllUsersRemote();
+    }).then(function (list) {
+      setState({ userList: list, newUserError: null, newUserSuccess: 'Compte @' + username + ' créé. Le mot de passe provisoire est : ' + password });
+    }).catch(function (e) {
+      state.auth = currentAuth; state.userProfile = currentProfile;
+      setState({ newUserError: e.message, newUserSuccess: null });
     });
   });
 
-  var userAdminOverlay = document.getElementById('userAdminOverlay');
-  if (userAdminOverlay) {
-    userAdminOverlay.addEventListener('click', function (e) { if (e.target === userAdminOverlay) setState({ showUserAdmin: false, confirmDeleteUserId: null }); });
-    document.getElementById('userAdminClose').addEventListener('click', function () { setState({ showUserAdmin: false, confirmDeleteUserId: null }); });
-    document.getElementById('userAdminSheet').addEventListener('click', function (e) { e.stopPropagation(); });
+  // Toggle actif/inactif
+  document.querySelectorAll('[data-toggle-active]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var uid = btn.getAttribute('data-toggle-active');
+      var u = state.userList.find(function (x) { return x.uid === uid; });
+      var newActif = !(u.actif !== false);
+      var newList = state.userList.map(function (x) { return x.uid === uid ? Object.assign({}, x, { actif: newActif }) : x; });
+      setState({ userList: newList });
+      setUserActiveRemote(u, newActif).catch(function () { setState({ error: "Échec de la mise à jour." }); });
+    });
+  });
 
-    document.querySelectorAll('[data-toggle-active]').forEach(function (btn) {
-      btn.addEventListener('click', function () {
-        var uid = btn.getAttribute('data-toggle-active');
-        var u = state.userList.find(function (x) { return x.uid === uid; });
-        var newActif = !(u.actif !== false);
-        var newList = state.userList.map(function (x) { return x.uid === uid ? Object.assign({}, x, { actif: newActif }) : x; });
-        setState({ userList: newList });
-        setUserActiveRemote(u, newActif).catch(function () { setState({ error: "Échec de la mise à jour du compte." }); });
-      });
+  // Réinitialisation mot de passe
+  document.querySelectorAll('[data-ask-reset]').forEach(function (btn) {
+    btn.addEventListener('click', function () { setState({ resetPasswordUserId: btn.getAttribute('data-ask-reset') }); });
+  });
+  document.querySelectorAll('[data-cancel-reset]').forEach(function (btn) {
+    btn.addEventListener('click', function () { setState({ resetPasswordUserId: null }); });
+  });
+  document.querySelectorAll('[data-confirm-reset]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var uid = btn.getAttribute('data-confirm-reset');
+      var input = document.getElementById('resetPwdInput_' + uid);
+      var newPwd = input ? input.value.trim() : '';
+      if (newPwd.length < 6) { setState({ error: 'Le mot de passe doit faire 6 caractères minimum.' }); return; }
+      adminResetPassword(uid, '', newPwd).then(function () { return fetchAllUsersRemote(); })
+        .then(function (list) { setState({ userList: list, resetPasswordUserId: null }); })
+        .catch(function () { setState({ error: 'Échec de la réinitialisation.' }); });
     });
-    document.querySelectorAll('[data-ask-delete-user]').forEach(function (btn) {
-      btn.addEventListener('click', function () { setState({ confirmDeleteUserId: btn.getAttribute('data-ask-delete-user') }); });
+  });
+
+  // Suppression de compte
+  document.querySelectorAll('[data-ask-delete-user]').forEach(function (btn) {
+    btn.addEventListener('click', function () { setState({ confirmDeleteUserId: btn.getAttribute('data-ask-delete-user') }); });
+  });
+  document.querySelectorAll('[data-confirm-delete-user]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var uid = btn.getAttribute('data-confirm-delete-user');
+      var newList = state.userList.filter(function (x) { return x.uid !== uid; });
+      setState({ userList: newList, confirmDeleteUserId: null });
+      deleteUserProfileRemote(uid).catch(function () { setState({ error: 'Échec de la suppression.' }); });
     });
-    document.querySelectorAll('[data-confirm-delete-user]').forEach(function (btn) {
-      btn.addEventListener('click', function () {
-        var uid = btn.getAttribute('data-confirm-delete-user');
-        var newList = state.userList.filter(function (x) { return x.uid !== uid; });
-        setState({ userList: newList, confirmDeleteUserId: null });
-        deleteUserProfileRemote(uid).catch(function () { setState({ error: "Échec de la suppression du compte." }); });
-      });
-    });
-  }
+  });
 
   var openAccount = document.getElementById('openAccount');
   if (openAccount) openAccount.addEventListener('click', function () { setState({ showAccount: true }); });
@@ -1188,12 +1301,15 @@ function attachEvents(filtered) {
   document.querySelectorAll('[data-view]').forEach(function (btn) {
     btn.addEventListener('click', function () {
       var view = btn.getAttribute('data-view');
-      setState({
-        showArchived: view === 'archives',
-        showRestitues: view === 'restitues',
-        filterStatus: 'all',
-        filterTournee: null,
-      });
+      if (view === 'comptes') {
+        setState({ showArchived: false, showRestitues: false, showUserAdmin: true, filterStatus: 'all', filterTournee: null });
+        if (!state.userList) {
+          fetchAllUsersRemote().then(function (list) { setState({ userList: list }); })
+            .catch(function () { setState({ error: 'Impossible de charger les comptes.' }); });
+        }
+      } else {
+        setState({ showArchived: view === 'archives', showRestitues: view === 'restitues', showUserAdmin: false, filterStatus: 'all', filterTournee: null });
+      }
     });
   });
 
