@@ -965,6 +965,10 @@ function renderUserAdminInline() {
   html += '<div class="field" style="margin:0;"><label class="field-label">Nom d\'utilisateur</label><input id="newUserUsername" class="input" autocapitalize="none" placeholder="sgreco" /></div>';
   html += '<div class="field" style="margin:0;"><label class="field-label">Mot de passe provisoire</label><input id="newUserPassword" class="input" placeholder="6 car. min." /></div>';
   html += '</div>';
+  html += '<div style="display:flex;align-items:center;gap:10px;margin-top:12px;padding:10px 12px;background:#0c1f2e;border-radius:10px;border:1px solid #234156;">' +
+    '<input type="checkbox" id="newUserAdmin" style="width:18px;height:18px;accent-color:#e8384f;cursor:pointer;" />' +
+    '<label for="newUserAdmin" style="font-size:13px;color:#e8efed;cursor:pointer;">Compte administrateur <span style="color:#8a9a9c;font-size:11px;">(accès complet : gestion des comptes, suppression de véhicules)</span></label>' +
+    '</div>';
   if (state.newUserError) html += '<div class="error-banner" style="margin-top:10px;">' + icon('alert', 14, '#f87171') + ' ' + escapeHtml(state.newUserError) + '</div>';
   if (state.newUserSuccess) html += '<div style="color:#4ade80;font-size:12px;margin-top:8px;">✓ ' + escapeHtml(state.newUserSuccess) + '</div>';
   html += '<button class="save-btn" id="createUserBtn" style="margin-top:12px;">Créer le compte</button>';
@@ -992,6 +996,7 @@ function renderUserAdminInline() {
       html += '</div>';
       html += '<div style="display:flex;gap:6px;flex-shrink:0;align-items:center;flex-wrap:wrap;justify-content:flex-end;">';
       html += '<button class="switch' + (actif ? ' on' : '') + '" data-toggle-active="' + u.uid + '" title="' + (actif ? 'Désactiver' : 'Activer') + '"><span class="knob"></span></button>';
+      html += '<button class="secondary-btn' + (u.admin ? ' on' : '') + '" data-toggle-admin="' + u.uid + '" style="font-size:11px;padding:0 8px;height:28px;' + (u.admin ? 'background:#3a0a10;border-color:#e8384f;color:#f87171;' : '') + '">' + (u.admin ? '★ Admin' : '☆ Admin') + '</button>';
       if (state.resetPasswordUserId === u.uid) {
         html += '<input id="resetPwdInput_' + u.uid + '" class="input" type="text" placeholder="Nouveau mdp" style="width:110px;font-size:12px;padding:6px 8px;" />';
         html += '<button class="secondary-btn" data-confirm-reset="' + u.uid + '">OK</button>';
@@ -1180,7 +1185,8 @@ function attachEvents(filtered) {
     }
     var currentAuth = JSON.parse(JSON.stringify(state.auth));
     var currentProfile = JSON.parse(JSON.stringify(state.userProfile));
-    signUp(username, password, { prenom: prenom, nom: nom, grade: grade, bureau: bureau, mustChangePassword: true, actif: true, admin: false }).then(function () {
+    var isAdmin = document.getElementById('newUserAdmin') && document.getElementById('newUserAdmin').checked;
+    signUp(username, password, { prenom: prenom, nom: nom, grade: grade, bureau: bureau, mustChangePassword: true, actif: true, admin: isAdmin }).then(function () {
       // Revenir à la session admin
       state.auth = currentAuth;
       state.userProfile = currentProfile;
@@ -1192,6 +1198,21 @@ function attachEvents(filtered) {
     }).catch(function (e) {
       state.auth = currentAuth; state.userProfile = currentProfile;
       setState({ newUserError: e.message, newUserSuccess: null });
+    });
+  });
+
+  // Toggle admin
+  document.querySelectorAll('[data-toggle-admin]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var uid = btn.getAttribute('data-toggle-admin');
+      var u = state.userList.find(function (x) { return x.uid === uid; });
+      var newAdmin = !u.admin;
+      var newList = state.userList.map(function (x) { return x.uid === uid ? Object.assign({}, x, { admin: newAdmin }) : x; });
+      setState({ userList: newList });
+      var profile = Object.assign({}, u);
+      delete profile.uid;
+      profile.admin = newAdmin;
+      saveUserProfile(uid, profile).catch(function () { setState({ error: 'Échec de la mise à jour du rôle.' }); });
     });
   });
 
